@@ -16,6 +16,7 @@ gait/feet terms, curriculum-ramped action-rate smoothing), with:
     slot stays alive for envs that use it
 """
 
+import dataclasses
 import math
 from copy import deepcopy
 
@@ -119,6 +120,11 @@ from mjlab.utils.noise import UniformNoiseCfg as Unoise
 
 from mjlab_microduck.robot.microduck_constants import MICRODUCK_WALK_ROBOT_CFG
 from mjlab_microduck.tasks import mdp as microduck_mdp
+from mjlab_microduck.tasks.outdoor_terrain import (
+    FOOT_SCAN_RAY_LIFT_M,
+    MICRODUCK_OUTDOOR_TERRAINS_CFG,
+    RaisedRingPatternCfg,
+)
 from mjlab_microduck.tasks.symmetry import PpoWithSymmetryCfg, SYMMETRY_CFG
 
 
@@ -193,8 +199,16 @@ def _soften_terrain_contacts(spec: _mujoco.MjSpec) -> None:
 def make_microduck_velocity_env_cfg(
     play: bool = False,
     rough: bool = False,
+    outdoor: bool = False,
 ) -> ManagerBasedRlEnvCfg:
-    """Create Microduck velocity tracking environment configuration."""
+    """Create Microduck velocity tracking environment configuration.
+
+    rough: box stairs/grid/slopes (MICRODUCK_ROUGH_TERRAINS_CFG).
+    outdoor: continuous uneven ground (MICRODUCK_OUTDOOR_TERRAINS_CFG, see
+    outdoor_terrain.py). Same sim/curriculum settings as rough; mutually exclusive.
+    """
+    if rough and outdoor:
+        raise ValueError("rough and outdoor terrains are mutually exclusive")
 
     std_standing = {
         # Lower body — tighter to keep the robot in home pose when standing
@@ -745,12 +759,26 @@ def make_microduck_velocity_env_cfg(
     )
 
     # Terrain
-    if not rough:
+    if not (rough or outdoor):
         cfg.scene.terrain.terrain_type = "plane"
         cfg.scene.terrain.terrain_generator = None
     else:
         cfg.scene.terrain.terrain_type = "generator"
-        cfg.scene.terrain.terrain_generator = MICRODUCK_ROUGH_TERRAINS_CFG
+        if outdoor:
+            # Own copy: the play branch below mutates the generator, and
+            # registration builds the play cfg after the training one.
+            cfg.scene.terrain.terrain_generator = deepcopy(MICRODUCK_OUTDOOR_TERRAINS_CFG)
+            # Lift foot_height_scan ray origins above the sole: heightfields
+            # give no hit to rays starting at/below their surface (see
+            # FOOT_SCAN_RAY_LIFT_M). Scoped to outdoor so Flat/Rough are unchanged.
+            cfg.scene.sensors = tuple(
+                dataclasses.replace(
+                    s, pattern=RaisedRingPatternCfg.from_ring(s.pattern, FOOT_SCAN_RAY_LIFT_M)
+                ) if s.name == "foot_height_scan" else s
+                for s in cfg.scene.sensors
+            )
+        else:
+            cfg.scene.terrain.terrain_generator = MICRODUCK_ROUGH_TERRAINS_CFG
 
         # Soften terrain box contacts: adjacent boxes at different heights create
         # hard edges that destabilise the contact solver and produce NaN forces.
@@ -885,7 +913,7 @@ def make_microduck_velocity_env_cfg(
         )
 
     # Disable default curriculum
-    if not rough:
+    if not (rough or outdoor):
         del cfg.curriculum["terrain_levels"]
     del cfg.curriculum["command_vel"]
 

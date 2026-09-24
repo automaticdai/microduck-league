@@ -94,6 +94,15 @@ register_mjlab_task(
     runner_cls=MicroduckOnPolicyRunner,
 )
 
+# Outdoor uneven ground (perlin/gravel/waves/stones/hills) — see outdoor_terrain.py.
+register_mjlab_task(
+    task_id="Mjlab-Velocity-Outdoor-MicroDuck",
+    env_cfg=make_microduck_velocity_env_cfg(outdoor=True),
+    play_env_cfg=make_microduck_velocity_env_cfg(play=True, outdoor=True),
+    rl_cfg=MicroduckRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
 # VelStand — walking + fall recovery + body pose control in one policy.
 register_mjlab_task(
     task_id="Mjlab-VelStand-Flat-MicroDuck",
@@ -256,6 +265,7 @@ _BL_ALLCOLLISIONS = MICRODUCK_ALLCOLLISIONS_BACKLASH_ROBOT_CFG
 _BACKLASH_TASKS = (
     ("Mjlab-Velocity-Flat-Backlash-MicroDuck", make_microduck_velocity_env_cfg, {}, MicroduckRlCfg, _BL_WALK),
     ("Mjlab-Velocity-Rough-Backlash-MicroDuck", make_microduck_velocity_env_cfg, {"rough": True}, MicroduckRlCfg, _BL_WALK),
+    ("Mjlab-Velocity-Outdoor-Backlash-MicroDuck", make_microduck_velocity_env_cfg, {"outdoor": True}, MicroduckRlCfg, _BL_WALK),
     ("Mjlab-VelStand-Flat-Backlash-MicroDuck", make_microduck_velstand_env_cfg, {}, MicroduckVelStandRlCfg, _BL_ALLCOLLISIONS),
     ("Mjlab-VelStand-Rough-Backlash-MicroDuck", make_microduck_velstand_env_cfg, {"rough": True}, MicroduckVelStandRlCfg, _BL_ALLCOLLISIONS),
     ("Mjlab-StandUp-Flat-Backlash-MicroDuck", make_microduck_standup_env_cfg, {}, MicroduckStandUpRlCfg, _BL_GROUNDCONTACT),
