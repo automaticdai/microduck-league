@@ -71,6 +71,7 @@ instead of locally (see [scripts/hf/README.md](scripts/hf/README.md)).
 | `Mjlab-SitStand-{Flat,Rough}-MicroDuck` | flat/rough | Commanded sit ↔ stand in one policy, gently, head commandable |
 | `Mjlab-GroundPick-{Flat,Rough}-MicroDuck` | flat/rough | Crouch and touch the ground with the mouth tip, return to stand |
 | `Mjlab-BallKick-Flat-MicroDuck` | flat | Kick a 70 mm / 15 g ball forward (actor is ball-blind) |
+| `Mjlab-Football-Flat-MicroDuck` | flat | Approach a tracked 70 mm ball and shoot into a physical goal; [training and tracker contract](docs/football.md) |
 | `Mjlab-Roulade-Flat-MicroDuck` | flat | Forward roll over the head, land back on the feet |
 | `Mjlab-Velocity-Flat-MicroDuck-Rollers` | flat | Roller-skate velocity tracking (passive wheels under the feet) |
 | `Mjlab-Velocity-Swizzle-MicroDuck` | flat | Classic symmetric swizzle skating |
@@ -109,6 +110,65 @@ read *through* the backlash (`qpos[servo] + qpos[backlash]`). Observation and
 action dims are unchanged, so ONNX export and the runtime need no changes.
 See `src/mjlab_microduck/tasks/backlash.py`.
 
+### Football: approach and score
+
+`Mjlab-Football-Flat-MicroDuck` trains the duck to approach a tracked ball,
+line up a right-foot shot into a physical goal, and remain standing afterward.
+The goal is 40 cm wide and 30 cm high, positioned 75 cm beyond the ball.
+A score requires the whole ball to cross between the posts and below the bar.
+The matching backlash task is `Mjlab-Football-Flat-Backlash-MicroDuck`.
+
+Start from a compatible 61D walking checkpoint. The helper transfers the actor
+and its observation normalizer, with a fresh critic, optimizer, and curriculum.
+Checkpoints are not bundled with this repository. Run the smoke test before
+starting a long run, on either a local CUDA GPU or a remote GPU server:
+
+```bash
+uv sync --locked
+
+# Validate this walking initialization: 64 environments, five iterations.
+uv run scripts/train_football.py --from-walking path/to/walking/model_3000.pt \
+  --num-envs 64 --iterations 5 --eval-every 5 --run-name football-smoke
+
+# Train for 5,000 iterations, checking standing and approach every 100.
+uv run scripts/train_football.py --from-walking path/to/walking/model_3000.pt \
+  --num-envs 4096 --iterations 5000 --eval-every 100 --run-name football
+```
+
+Runs and checkpoints are saved under `logs/rsl_rl/football/<timestamp>_<run-name>/`.
+Evaluation checks stop training on a substantial standing or approach regression.
+To keep training while recording those failures, add `--continue-on-regression`.
+This changes the evaluation stop policy; physical balance checks remain active.
+
+```bash
+# Resume full training state. --iterations counts ADDITIONAL iterations:
+# checkpoint 999 + 4,000 more finishes at checkpoint 4999 (5,000 total).
+uv run scripts/train_football.py --resume path/to/football/model_999.pt \
+  --num-envs 4096 --iterations 4000 --eval-every 100 --run-name football-resume
+
+# Watch repeated approach-and-shoot episodes in an interactive browser viewer.
+# Open the localhost URL printed by the viewer (normally port 8080).
+uv run play Mjlab-Football-Flat-MicroDuck \
+  --checkpoint-file path/to/football/model_4999.pt --num-envs 1 --viewer viser
+
+# Evaluate 192 approach episodes; add --idle for standing or
+# --near-probability 1 for shots starting beside the ball.
+uv run scripts/eval_football.py --checkpoint-file path/to/football/model_4999.pt \
+  --output logs/football_eval.json --video logs/football_eval.mp4
+
+# Export through the normalizer-aware export path.
+uv run scripts/export.py Mjlab-Football-Flat-MicroDuck \
+  --checkpoint-file path/to/football/model_4999.pt --num-envs 1 \
+  --onnx-file football.onnx
+```
+
+The actor retains the shared 61D observation contract. Simulation supplies a
+ball-and-goal tracker that converts object positions into navigation commands;
+hardware needs an equivalent tracker and strike detector. The ONNX alone does
+not provide vision or navigation, and this task cannot use the constant-command
+`publish` workflow. See [the football guide](docs/football.md) for scoring,
+standing checks, physics validation, and evaluation details.
+
 ## Actuator model
 
 All tasks use the [BAM](https://github.com/Rhoban/bam) M6 actuator model for
@@ -130,7 +190,7 @@ one `config_mjcf_*.json` per model:
 | XML | Used by |
 |---|---|
 | `robot_walk.xml` | Velocity (stripped trunk/head contacts — falling is cheap) |
-| `robot_groundcontact.xml` | VelStand, StandUp, SitStand, GroundPick, BallKick, Roulade (curated collision set for the parts that touch the floor — body can physically lie on the ground; formerly `robot_allcollisions.xml`) |
+| `robot_groundcontact.xml` | VelStand, StandUp, SitStand, GroundPick, BallKick, Football, Roulade (curated collision set for the parts that touch the floor — body can physically lie on the ground; formerly `robot_allcollisions.xml`) |
 | `robot_groundcontact_rollers.xml` | Roller tasks (passive wheels) |
 | `robot_allcollisions.xml` | True full-collision model — every part has a collision geom. No task uses it yet |
 | `robot_*_backlash.xml` | Backlash task variants (generated by `add_backlash.py`) |
