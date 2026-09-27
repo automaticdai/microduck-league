@@ -38,6 +38,7 @@ class ExportConfig:
     wandb_run_path: str | None = None
     checkpoint: int | None = None      # Select checkpoint by iteration number (e.g. 3000)
     checkpoint_file: str | None = None
+    actor_only: bool = False  # Export older actors after a critic observation change.
     motion_file: str | None = None
     num_envs: int | None = None
     device: str | None = None
@@ -246,7 +247,11 @@ def run_export(task_id: str, cfg: ExportConfig) -> ExportResult:
     else:
         runner_cls = load_runner_cls(task_id) or OnPolicyRunner
         runner = runner_cls(env, asdict(agent_cfg), device=device)
-        runner.load(str(resume_path), map_location=device)
+        if cfg.actor_only:
+            # Actor state includes its normalizer; critic/optimizer are unused by ONNX.
+            runner.load(str(resume_path), load_cfg={"actor": True}, map_location=device)
+        else:
+            runner.load(str(resume_path), map_location=device)
         policy = runner.get_inference_policy(device=device)
 
     # mjlab 1.3.0: ONNX export + metadata moved to mjlab.rl.exporter_utils and
