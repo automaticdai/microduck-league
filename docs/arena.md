@@ -132,3 +132,41 @@ playback. Browser drawing remains WebGL on the client machine.
 `--compile-friction` fuses the BAM friction arithmetic without changing its
 formula. The first launch compiles kernels before opening the viewer. To measure
 simulation throughput without the browser, add `--benchmark-steps 250`.
+
+## Kick-first v3, learned keeper, and the shot eval (2026-09-30)
+
+`scripts/eval_arena_shots.py` is the arena scoreboard. It records the first round of every
+arena (no bias toward short rounds), tracks every learner touch to its outcome (goal, wide,
+out, blocked, re-touch), and reports fall timing. Use it against three opponents
+(`--solo`, `--opponent-role keeper`, default attacker), with `--aim open` and 2048 rounds.
+GPU rollouts are not repeatable run to run, so compare rates with their standard errors.
+
+Findings that shaped v3:
+- v2 lost the source kick (solo goals 83% → 37%). The cause was fine-tuning against a
+  fresh, unfitted critic, not the reward. `train_arena.py --critic-warmup N` freezes the
+  actor while the critic fits; always use it when the critic starts from scratch.
+- Rounds were decided by about 2 s, then ran dead: the ball left play with no walls and
+  near-zero rolling friction. v3 ends the round when the ball goes out and charges a fall
+  once (−10) instead of per second.
+- The tracker aimed at the goal center, which is exactly where a keeper stands.
+  `ArenaCommandCfg.aim='open'` aims at the widest gap beside the opponent's shadow.
+
+Tasks:
+- `Mjlab-FootballArena-V3-Flat-MicroDuck` (kick-first-v3): starts from the football kicker
+  and stages opponents per arena (empty goal → keeper → attacker, `V3_MODE_STAGES`).
+  `train_arena.py --mode-probs S K A` overrides the mix.
+- `Mjlab-FootballArena-Keeper-Flat-MicroDuck` (keeper-v1): the learner keeps the −x goal
+  against a frozen attacker (`--no-self-play`). Conceding costs −100; a clean round pays +5.
+
+Results (goals within 10 s, 2048 rounds, open aim; source kicker football@4999 shown first):
+empty goal 83% → 88% (attacker @3699); vs scripted keeper 30% → 64%; vs attacker
+9.8%/7.5% → 12.9%/8.2% (scored/conceded). The learned keeper @1699 lets in 12.5% of v3@2199
+shots, against 54.8% for the scripted keeper at the same speed limits.
+
+Viewer: `play_football_arena_gpu.py` takes `--opponent-role {attacker,keeper,solo}`,
+`--opponent-policy`, `--aim`, plus boards around the pitch (`--no-boards` to remove them) and a
+2 s play-on after goals (`--goal-hold`). Training uses neither by default.
+
+Open issue: StandUp (3000–9000 iterations) rises from sitting but not from lying down.
+From face-down it reaches standing height but stays pitched about 34°, so a get-up swap
+(`eval_arena_shots.py --getup-policy`) recovers only 3–4% of falls.

@@ -122,3 +122,52 @@ def test_playback_keeps_goal_rules_without_training_sensors():
     assert term.scored[0]
     assert env.arena_goal_result[0] == 1
     assert torch.equal(term.previous_ball,env.scene['ball'].data.root_link_pos_w)
+
+
+def test_fall_event_fires_once_after_persisting_and_rearms_on_recovery():
+    env,term=arena()
+    height=env.scene['robot'].data.root_link_pos_w[:,2]
+    height[0]=.06  # Env 0 falls and stays down; env 1 dips for 3 steps then recovers.
+    height[1]=.06
+    paid=torch.zeros(4)
+    for step in range(25):
+        if step == 3:
+            height[1]=.12
+        env.common_step_counter=step
+        term.update_match()
+        paid+=term.fall_delta*env.step_dt
+        if step == term.cfg.fall_persist_steps-1:
+            assert term.fall_delta[0]*env.step_dt == 1
+    assert paid.tolist()==[1.,0.,0.,0.]
+
+
+def test_ball_out_rules():
+    env,term=arena()
+    ball=env.scene['ball'].data.root_link_pos_w
+    ball[:,:2]=torch.tensor([[0.,.70],[.95,.3],[.95,0.],[-.95,.3]])  # Last: behind own line, wide.
+    term.update_match()
+    term.scored[2]=True  # Through the mouth: a goal, not a dead ball.
+    assert mdp.arena_ball_out(env).tolist()==[True,True,False,True]
+
+
+def test_mode_metrics_split_by_opponent():
+    env,term=arena()
+    env.arena_opponent_mode=torch.tensor([0,1,2,2])
+    term.scored[:]=torch.tensor([True,True,False,True])
+    assert mdp.arena_metric(env,'mode_keeper').tolist()==[0.,1.,0.,0.]
+    assert mdp.arena_metric(env,'scored_vs_attacker').tolist()==[0.,0.,0.,1.]
+    assert mdp.arena_metric(env,'scored_vs_solo').tolist()==[1.,0.,0.,0.]
+
+
+def test_goal_hold_delays_round_end_but_pays_once():
+    env,term=arena()
+    term.cfg.goal_hold_s=.1  # 5 steps
+    ball=env.scene['ball'].data.root_link_pos_w
+    ball[0,:2]=torch.tensor([.95,0.])  # Crosses the mouth from x=.3.
+    ends,paid=[],0.
+    for step in range(8):
+        env.common_step_counter=step
+        ends.append(bool(mdp.arena_goal_done(env)[0]))
+        paid+=float(term.goal_delta[0])*env.step_dt
+    assert paid==1. and ends==[False]*5+[True]*3
+    term.cfg.goal_hold_s=0.

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 from dataclasses import asdict
 import json
 from pathlib import Path
@@ -23,7 +24,10 @@ from mjlab_microduck.robot.microduck_constants import get_standup_spec
 TASK = 'Mjlab-FootballArena-Flat-MicroDuck'
 
 
-def pitch_spec():
+BOARD_HEIGHT = .08
+
+
+def pitch_spec(boards=False):
     spec = mujoco.MjSpec()
     body = spec.worldbody.add_body(name='pitch')
     def box(name,pos,size,color):
@@ -38,6 +42,15 @@ def pitch_spec():
         body.add_geom(type=mujoco.mjtGeom.mjGEOM_CAPSULE,size=[.003,0,0],
             fromto=[.22*np.cos(a),.22*np.sin(a),.001,.22*np.cos(b),.22*np.sin(b),.001],
             rgba=[1,1,1,1],contype=0,conaffinity=0)
+    if boards:
+        # Low boards: side lines, plus end lines beside each goal (the goal and net close the mouth).
+        h = BOARD_HEIGHT/2
+        walls = [(0,.665,.945,.005),(0,-.665,.945,.005)]
+        for x in (.94,-.94):
+            walls += [(x,.44,.005,.23),(x,-.44,.005,.23)]
+        for i,(x,y,sx,sy) in enumerate(walls):
+            body.add_geom(name=f'board_{i}',type=mujoco.mjtGeom.mjGEOM_BOX,pos=[x,y,h],size=[sx,sy,h],
+                          rgba=[.95,.95,.95,.9],contype=1,conaffinity=1)
     return spec
 
 
@@ -54,10 +67,11 @@ def orange_spec():
     return spec
 
 
-def playback_cfg():
+def playback_cfg(boards=True,goal_hold_s=2.):
     cfg=load_env_cfg(TASK,play=True)
     cfg.scene.num_envs=1
-    cfg.scene.entities['pitch']=EntityCfg(spec_fn=pitch_spec)
+    cfg.scene.entities['pitch']=EntityCfg(spec_fn=lambda: pitch_spec(boards=boards))
+    cfg.commands['twist'].goal_hold_s=goal_hold_s
     cfg.scene.entities['robot'].spec_fn=blue_spec
     cfg.scene.entities['opponent'].spec_fn=orange_spec
     # Playback needs actor inputs and match rules, not training diagnostics.
@@ -85,6 +99,7 @@ class MatchEnv(RslRlVecEnvWrapper):
         self.round=1
         self.elapsed=0.
         self.last_event='Kickoff'
+        self.goal_this_round=False
         self.cached_obs=None
         super().__init__(env,clip_actions)
 
@@ -110,18 +125,21 @@ class MatchEnv(RslRlVecEnvWrapper):
             player=0 if event[0]>0 else 1
             self.score[player]+=1
             self.last_event=f'{("Blue","Orange")[player]} scores!'
-        elif event[1]:
+            self.goal_this_round=True
+        elif event[1] and not self.goal_this_round:
             self.last_event='Timeout' if self.elapsed>=9.99 else 'Numerical reset'
         if event[1]:
             print(json.dumps({'score':self.score,'round':self.round,'event':self.last_event}),flush=True)
             self.round+=1
             self.elapsed=0.
+            self.goal_this_round=False
         return result
 
 
 class ArenaViewer(ViserPlayViewer):
-    def __init__(self,*args,checkpoint,**kwargs):
+    def __init__(self,*args,checkpoint,opponent_label='mirror',**kwargs):
         self.checkpoint=checkpoint
+        self.opponent_label=opponent_label
         self.last_panel_update=0.
         self.last_perf_log=0.
         super().__init__(*args,**kwargs)
@@ -137,7 +155,15 @@ class ArenaViewer(ViserPlayViewer):
     @torch.inference_mode()
     def _handle_gui_reset(self, all_envs):
         super()._handle_gui_reset(all_envs)
-        self.env.cached_obs=None
+        match=self.env
+        match.cached_obs=None
+        # A manual reset starts a new match: clear the scoreboard and round counter too.
+        match.score=[0,0]
+        match.round=1
+        match.elapsed=0.
+        match.goal_this_round=False
+        match.last_event='Kickoff'
+        self.score_label.text='Blue 0:0 Orange'
 
     def _execute_step(self):
         with torch.inference_mode():
@@ -157,7 +183,7 @@ class ArenaViewer(ViserPlayViewer):
         if now-self.last_perf_log >= 5:
             self.last_perf_log=now
             print(json.dumps({'realtime_factor':status.actual_realtime,'viewer_fps':status.smoothed_fps}),flush=True)
-        self.panel.content=(f'## {score}\n\nPolicy: **{self.checkpoint.stem}**\n\n'
+        self.panel.content=(f'## {score}\n\nBlue: **{self.checkpoint.stem}** · Orange: **{self.opponent_label}**\n\n'
             f'**{torch.cuda.get_device_name(0)} · CUDA physics + inference**\n\n'
             f'Playback: **{status.actual_realtime:.2f}× real time**\n\n'
             f'Round {match.round} · {match.elapsed:.1f} / 10 s · {match.last_event}')
@@ -169,12 +195,21 @@ def main():
     parser.add_argument('--port',type=int,default=8081)
     parser.add_argument('--benchmark-steps',type=int,default=0)
     parser.add_argument('--compile-friction',action='store_true')
+    parser.add_argument('--opponent-role',choices=('attacker','keeper','solo'),default='attacker',
+                        help='Orange duck: mirror attacker, goalkeeper, or parked off-pitch')
+    parser.add_argument('--opponent-policy',type=Path,help='Orange checkpoint; default: same as --checkpoint')
+    parser.add_argument('--goal-hold',type=float,default=2.,help='Seconds of play after a goal before the reset')
+    parser.add_argument('--no-boards',action='store_true',help='Open pitch: the ball can roll away forever')
+    parser.add_argument('--aim',choices=('center','open'),default='center',help="Blue tracker aim (open = beside orange's shadow)")
     args=parser.parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError('CUDA is required for this viewer; use play_football_arena.py for CPU playback')
     torch.set_num_threads(1)
     configure_torch_backends()
-    cfg=playback_cfg()
+    cfg=playback_cfg(boards=not args.no_boards,goal_hold_s=args.goal_hold)
+    probs={'solo':(1.,0.,0.),'keeper':(0.,1.,0.),'attacker':(0.,0.,1.)}[args.opponent_role]
+    cfg.events['reset_arena'].params['mode_stages']=[{'step':0,'probs':probs}]
+    cfg.commands['twist'].aim=args.aim
     agent=load_rl_cfg(TASK)
     agent.obs_groups={'actor':('actor',),'critic':('actor',)}
     env=ManagerBasedRlEnv(cfg,device='cuda:0')
@@ -189,6 +224,11 @@ def main():
         runner.load(str(args.checkpoint),load_cfg={'actor':True},map_location='cuda:0')
         policy=runner.get_inference_policy(device='cuda:0')
         env.arena_opponent_policy=policy
+        if args.opponent_policy:
+            opponent=deepcopy(runner.alg.actor).eval().requires_grad_(False)
+            opponent.load_state_dict(torch.load(args.opponent_policy,map_location='cuda:0',
+                                                weights_only=False)['actor_state_dict'])
+            env.arena_opponent_policy=opponent
         assert next(runner.alg.actor.parameters()).device.type=='cuda'
         print(f'Physics and both policies on {torch.cuda.get_device_name(0)}',flush=True)
         # Set only the background plane color; pitch markings are separate visuals.
@@ -218,7 +258,8 @@ def main():
             import viser
             server=viser.ViserServer(host='0.0.0.0',port=args.port,label='Microduck Go · CUDA')
             with torch.inference_mode():
-                ArenaViewer(wrapped,policy,viser_server=server,checkpoint=args.checkpoint).run()
+                ArenaViewer(wrapped,policy,viser_server=server,checkpoint=args.checkpoint,
+                    opponent_label=f'{args.opponent_role} ({(args.opponent_policy or args.checkpoint).stem})').run()
     finally:
         env.close()
 

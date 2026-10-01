@@ -7703,12 +7703,16 @@ def roulade_lateral_velocity_penalty(
 from mjlab.envs.mdp.actions.actions import JointPositionAction, JointPositionActionCfg
 
 
-def arena_navigation(env, entity_name, attack_sign):
+def arena_navigation(env, entity_name, attack_sign, target=None):
+    """Attack tracker command; `target` (env-local xy) replaces the goal-center aim point."""
     robot = env.scene[entity_name].data
     ball = env.scene['ball'].data.root_link_pos_w
     origins = env.scene.terrain.env_origins
     goal = origins[:, :2].clone()
-    goal[:, 0] += .9 * attack_sign
+    if target is None:
+        goal[:, 0] += .9 * attack_sign
+    else:
+        goal += target
     q = robot.root_link_quat_w
     yaw = torch.atan2(2*(q[:,0]*q[:,3]+q[:,1]*q[:,2]), 1-2*(q[:,2]**2+q[:,3]**2))
     c,s = yaw.cos(),yaw.sin()
@@ -7719,6 +7723,110 @@ def arena_navigation(env, entity_name, attack_sign):
         torch.zeros(env.num_envs,dtype=torch.bool,device=env.device))
 
 
+def arena_open_aim(ball_xy, blocker_xy, previous_side, blocker_radius=.12, post_margin=.02, hysteresis=.2):
+    """Aim point on the +x goal line: middle of the widest mouth gap beside the blocker's shadow.
+
+    Angles are seen from the ball; the shadow is the blocker's body half-width (8.5 cm) plus
+    the ball radius. A shadow missing the mouth keeps the goal-center aim exactly. With
+    both gaps closed, aim at the mouth edge farther from the blocker. `previous_side`
+    (+1 left, -1 right, 0 none) needs a hysteresis-times-wider gap to switch sides.
+    Returns (aim_xy, side).
+    """
+    line = .935  # Ball-center crossing plane; mouth |y| <= .165 there (update_match).
+    half = .165-post_margin
+    dx = (line-ball_xy[:,0]).clamp_min(1e-3)
+    lo = torch.atan2(-half-ball_xy[:,1],dx)
+    hi = torch.atan2(half-ball_xy[:,1],dx)
+    rel = blocker_xy-ball_xy
+    dist = torch.linalg.vector_norm(rel,dim=-1)
+    ahead = (rel[:,0] > 0) & (blocker_xy[:,0] < line+.1)
+    center = torch.atan2(rel[:,1],rel[:,0])
+    spread = torch.asin((blocker_radius/dist.clamp_min(1e-6)).clamp(max=1.))
+    right = (torch.minimum(hi,center-spread)-lo).clamp_min(0)
+    left = (hi-torch.maximum(lo,center+spread)).clamp_min(0)
+    closed = (left <= 0) & (right <= 0)
+    # Closed mouth: compare each edge's angular distance from the shadow center instead.
+    left_score = torch.where(closed, hi-center, left)
+    right_score = torch.where(closed, center-lo, right)
+    pick_left = torch.where(previous_side > 0, left_score*(1+hysteresis) >= right_score,
+                torch.where(previous_side < 0, left_score > right_score*(1+hysteresis), left_score > right_score))
+    angle = torch.where(closed, torch.where(pick_left, hi, lo), torch.where(pick_left, hi-left/2, lo+right/2))
+    side = torch.where(pick_left, 1, -1)
+    blocking = ahead & (center-spread < hi) & (center+spread > lo)
+    side = torch.where(blocking, side, torch.zeros_like(side))
+    aim = torch.stack((torch.full_like(dx,line), ball_xy[:,1]+dx*torch.tan(angle)),-1)
+    center_aim = torch.zeros_like(aim)
+    center_aim[:,0] = .9  # Exactly the default tracker's target when nothing blocks.
+    return torch.where(blocking[:,None],aim,center_aim), side
+
+
+def arena_keeper_command(robot_xy, yaw, ball_xy, goal_xy, defend_sign, distance=.2,
+                         deadband=.06, turn_deadband=.25, max_speed=(.15,.25,.12,.5)):
+    """Goalkeeper [vx, vy, wz]: hold the ball-to-goal-center line, facing up the field.
+
+    The spot sits `distance` from the goal center, at least 8 cm in front of the line
+    and within the posts. Commands are exact zero (the actor's trained idle) or at least
+    2*deadband m/s: the football actor stumbles on small non-zero translation. Holding a
+    still ball for 10 s, 22% of keepers fell with a 3 cm deadband, 1.6% at 6 cm and 0 at zero.
+    It faces the ball, but no more than 60 deg off the field direction, and holds still while
+    the ball is out of play. Chasing wide balls saturated vx, vy and wz together, and a
+    fixed field heading made it strafe: 72% fell in a cross-goal roll, against 13% when facing the ball.
+    """
+    spot = goal_xy + distance*torch.nn.functional.normalize(ball_xy-goal_xy,dim=-1)
+    depth = ((goal_xy[:,0]-spot[:,0])*defend_sign).clamp_min(.08)
+    spot = torch.stack((goal_xy[:,0]-defend_sign*depth, spot[:,1].clamp(-.2,.2)),-1)
+    c,s = yaw.cos(),yaw.sin()
+    def local(x):
+        return torch.stack((c*x[:,0]+s*x[:,1], -s*x[:,0]+c*x[:,1]),-1)
+    error = local(spot-robot_xy)
+    field_yaw = math.pi if defend_sign > 0 else 0.
+    to_ball = ball_xy-robot_xy
+    offset = torch.atan2(to_ball[:,1],to_ball[:,0])-field_yaw
+    offset = torch.atan2(offset.sin(),offset.cos()).clamp(-math.pi/3,math.pi/3)
+    heading = field_yaw+offset-yaw
+    heading = torch.atan2(heading.sin(),heading.cos())
+    velocity = 2.0*error*(torch.linalg.vector_norm(error,dim=-1) >= deadband)[:,None]
+    turn = (2.0*heading).clamp(-1.,1.)*(heading.abs() >= turn_deadband)
+    # Slower than the attack tracker (.25,.35,.20,1.): 19% -> 5.5% keeper fallen time in matches.
+    back,fwd,side,yaw_rate = max_speed
+    command = torch.stack((velocity[:,0].clamp(-back,fwd),velocity[:,1].clamp(-side,side),
+                           turn.clamp(-yaw_rate,yaw_rate)),dim=1)
+    in_play = (ball_xy[:,0].abs() <= .9) & (ball_xy[:,1].abs() <= .65)
+    command = command*in_play[:,None]
+    return torch.nan_to_num(command,nan=0.,posinf=0.,neginf=0.)
+
+
+def arena_keeper_navigation(env, entity_name, defend_sign, distance=.2, clear_radius=0.,
+                            max_speed=(.15,.25,.12,.5)):
+    """Keeper command in the entity's yaw frame; balls within clear_radius of the goal get cleared."""
+    data = env.scene[entity_name].data
+    origin = env.scene.terrain.env_origins[:,:2]
+    ball = env.scene['ball'].data.root_link_pos_w[:,:2]-origin
+    goal = torch.zeros_like(ball)
+    goal[:,0] = .9*defend_sign
+    q = data.root_link_quat_w
+    yaw = torch.atan2(2*(q[:,0]*q[:,3]+q[:,1]*q[:,2]), 1-2*(q[:,2]**2+q[:,3]**2))
+    command = arena_keeper_command(data.root_link_pos_w[:,:2]-origin,yaw,ball,goal,defend_sign,distance,
+                                   max_speed=max_speed)
+    if clear_radius > 0:
+        clear = torch.linalg.vector_norm(ball-goal,dim=-1) < clear_radius
+        command = torch.where(clear[:,None],arena_navigation(env,entity_name,-defend_sign),command)
+    return command
+
+
+# Per-arena opponent behaviour, sampled at every reset by reset_arena(mode_stages=...).
+ARENA_OPPONENT_MODES = ('solo','keeper','attacker')
+SOLO,KEEPER,ATTACKER = range(3)
+
+
+def arena_opponent_mode(env):
+    """Per-env mode tensor; arenas without mode_stages always face an attacker."""
+    mode = getattr(env,'arena_opponent_mode',None)
+    if mode is None:
+        mode = env.arena_opponent_mode = torch.full((env.num_envs,),ATTACKER,dtype=torch.long,device=env.device)
+    return mode
+
+
 class ArenaJointPositionAction(JointPositionAction):
     """Fourteen learned actions plus fourteen independently inferred actions."""
     def __init__(self,cfg,env):
@@ -7726,6 +7834,16 @@ class ArenaJointPositionAction(JointPositionAction):
         self.opponent = JointPositionAction(JointPositionActionCfg(
             entity_name='opponent', actuator_names=('^(?!passive_).*',),scale=1.0),env)
         self.opponent_velocity = torch.zeros_like(self._raw_actions)
+
+    def opponent_command(self):
+        """Attacker: attack tracker. Keeper: arena_keeper_navigation. Solo: exact-zero idle, parked off-pitch."""
+        mode = arena_opponent_mode(self._env)
+        command = arena_navigation(self._env,'opponent',-1)
+        keeper = mode == KEEPER
+        if keeper.any():
+            command = torch.where(keeper[:,None],arena_keeper_navigation(self._env,'opponent',1,
+                self.cfg.keeper_distance,self.cfg.keeper_clear_radius,self.cfg.keeper_max_speed),command)
+        return command*(mode != SOLO)[:,None]
 
     def process_actions(self,actions):
         super().process_actions(actions)
@@ -7735,7 +7853,7 @@ class ArenaJointPositionAction(JointPositionAction):
         ids = _servo_joint_ids(env,asset)
         obs = torch.cat((data.root_link_ang_vel_b,data.projected_gravity_b,
             data.joint_pos[:,ids]-data.default_joint_pos[:,ids],self.opponent_velocity,
-            self.opponent.raw_action,arena_navigation(env,'opponent',-1),
+            self.opponent.raw_action,self.opponent_command(),
             torch.zeros(env.num_envs,10,device=env.device)),dim=-1)
         self.opponent_velocity[:] = data.joint_vel[:,ids]
         policy = getattr(env,'arena_opponent_policy',None)
@@ -7757,6 +7875,10 @@ class ArenaJointPositionAction(JointPositionAction):
 
 @dataclass(kw_only=True)
 class ArenaJointPositionActionCfg(JointPositionActionCfg):
+    keeper_distance: float = .2  # Keeper spot and spawn: this far in front of its goal center.
+    keeper_clear_radius: float = 0.
+    keeper_max_speed: tuple[float,float,float,float] = (.15,.25,.12,.5)  # back, fwd, side, yaw rate
+
     def build(self,env):
         return ArenaJointPositionAction(self,env)
 
@@ -7764,6 +7886,10 @@ class ArenaJointPositionActionCfg(JointPositionActionCfg):
 class ArenaCommand(CommandTerm):
     def __init__(self,cfg,env):
         super().__init__(cfg,env)
+        if cfg.aim not in ('center','open'):
+            raise ValueError(f'Unknown arena aim: {cfg.aim}')
+        if cfg.role not in ('attacker','keeper'):
+            raise ValueError(f'Unknown arena learner role: {cfg.role}')
         self._command = torch.zeros(self.num_envs,3,device=self.device)
         self.previous_ball = torch.zeros_like(self._command)
         self.scored = torch.zeros(self.num_envs,dtype=torch.bool,device=self.device)
@@ -7779,6 +7905,12 @@ class ArenaCommand(CommandTerm):
         self.strike_delta = torch.zeros_like(self.goal_delta)
         self.shot_speed_delta = torch.zeros_like(self.goal_delta)
         self.best_shot_speed = torch.zeros_like(self.goal_delta)
+        self.aim_side = torch.zeros(self.num_envs,dtype=torch.long,device=self.device)
+        self.aim_xy = torch.tensor([[.9,0.]],device=self.device).repeat(self.num_envs,1)
+        self.down_steps = torch.zeros(self.num_envs,dtype=torch.long,device=self.device)
+        self.fall_delta = torch.zeros_like(self.goal_delta)
+        self.settle_steps = torch.zeros(self.num_envs,dtype=torch.long,device=self.device)
+        self.goal_steps = torch.zeros(self.num_envs,dtype=torch.long,device=self.device)
         self._last_step = -1
 
     @property
@@ -7792,7 +7924,24 @@ class ArenaCommand(CommandTerm):
         pass
 
     def _update_command(self):
-        self._command[:] = arena_navigation(self._env,'robot',1)
+        if self.cfg.role == 'keeper':
+            # Learner keeps the -x goal against the opponent's attack (arena_keeper_command).
+            self._command[:] = arena_keeper_navigation(self._env,'robot',-1,self.cfg.keeper_distance,
+                0.,self.cfg.keeper_max_speed)
+        elif self.cfg.aim == 'open':
+            env = self._env
+            origin = env.scene.terrain.env_origins[:,:2]
+            self.aim_xy[:],self.aim_side[:] = arena_open_aim(env.scene['ball'].data.root_link_pos_w[:,:2]-origin,
+                env.scene['opponent'].data.root_link_pos_w[:,:2]-origin,self.aim_side)
+            self._command[:] = arena_navigation(env,'robot',1,self.aim_xy)
+        else:
+            self._command[:] = arena_navigation(self._env,'robot',1)
+        if self.cfg.post_strike_settle_s > 0:
+            # Football trained kick-then-stand: exact-zero command after a strike.
+            hold = round(self.cfg.post_strike_settle_s/self._env.step_dt)
+            struck = arena_supported_strike(self._env)
+            self.settle_steps[:] = torch.where(struck,hold,(self.settle_steps-1).clamp_min(0))
+            self._command[self.settle_steps > 0] = 0.
 
     def update_match(self):
         env = self._env
@@ -7813,12 +7962,16 @@ class ArenaCommand(CommandTerm):
             flag |= new_goal
             self.goal_delta += direction * new_goal.float()/env.step_dt
         env.arena_goal_result = self.goal_delta.clone() * env.step_dt
+        self.goal_steps += self.scored | self.conceded
         if not self.cfg.track_training_signals:
             self.previous_ball[:] = ball + origin
             return
         upright = arena_upright(env)
+        # A fall is 0.2 s continuously down; brief kick tilts that recover are not charged.
+        self.down_steps[:] = torch.where(upright,0,self.down_steps+1)
+        self.fall_delta[:] = (self.down_steps == self.cfg.fall_persist_steps).float()/env.step_dt
         robot_xy = env.scene['robot'].data.root_link_pos_w[:,:2]-origin[:,:2]
-        stance = arena_kick_stance(ball[:,:2])
+        stance = arena_kick_stance(ball[:,:2],self.aim_xy)
         distance = torch.linalg.vector_norm(robot_xy-stance,dim=-1)
         approach = (self.initial_distance-distance).clamp_min(0)
         target = torch.zeros_like(ball[:,:2])
@@ -7854,21 +8007,51 @@ class ArenaCommand(CommandTerm):
 @dataclass(kw_only=True)
 class ArenaCommandCfg(CommandTermCfg):
     track_training_signals: bool = True
+    # 'open': tracker aims beside the opponent (arena_open_aim); the approach reward's
+    # kick stance follows the same aim point.
+    aim: str = 'center'
+    fall_persist_steps: int = 10  # fall_delta fires once after this many steps down
+    post_strike_settle_s: float = 0.  # >0: exact-zero command this long after each supported strike
+    goal_hold_s: float = 0.  # Play on this long after a goal before the round ends (playback)
+    role: str = 'attacker'  # 'keeper': the learner defends its goal, spawning keeper_distance in front of it
+    keeper_distance: float = .2
+    keeper_max_speed: tuple[float,float,float,float] = (.2,.3,.15,.75)  # Learned keeper: a bit above the scripted one
 
     def build(self,env):
         return ArenaCommand(self,env)
 
 
-def reset_arena(env,env_ids):
+def arena_stage_probs(env,mode_stages):
+    """(solo, keeper, attacker) probabilities of the latest stage whose step has elapsed."""
+    probs = mode_stages[0]['probs']
+    for stage in mode_stages:
+        if env.common_step_counter >= stage['step']:
+            probs = stage['probs']
+    return probs
+
+
+def reset_arena(env,env_ids,mode_stages=None):
     if env_ids is None:
         env_ids = torch.arange(env.num_envs,device=env.device)
     n = len(env_ids)
     origin = env.scene.terrain.env_origins[env_ids]
+    mode = arena_opponent_mode(env)
+    term = env.command_manager.get_term('twist')
+    robot_spawn_x = .9-term.cfg.keeper_distance if term.cfg.role == 'keeper' else .38
+    if mode_stages is not None:
+        probs = torch.tensor(arena_stage_probs(env,mode_stages),dtype=torch.float,device=env.device)
+        mode[env_ids] = torch.multinomial(probs,n,replacement=True)
+    keeper_distance = env.action_manager.get_term('joint_pos').cfg.keeper_distance
+    spawn = torch.tensor([[.38,1.5],[.9-keeper_distance,0.],[.38,0.]],device=env.device)[mode[env_ids]]
+    opponent_local = spawn.clone()
     for name,sign in (('robot',1),('opponent',-1)):
         asset = env.scene[name]
         pose = torch.zeros(n,7,device=env.device)
         pose[:,:3] = origin
-        pose[:,0] -= sign*.38
+        if name == 'robot':
+            pose[:,0] -= robot_spawn_x
+        else:
+            pose[:,:2] += spawn
         pose[:,2] += .125
         pose[:,3 if sign == 1 else 6] = 1
         asset.write_root_link_pose_to_sim(pose,env_ids)
@@ -7897,14 +8080,22 @@ def reset_arena(env,env_ids):
     term.scored[env_ids] = False
     term.conceded[env_ids] = False
     term.struck[env_ids] = False
+    term.aim_side[env_ids] = 0
+    term.settle_steps[env_ids] = 0
+    term.goal_steps[env_ids] = 0
     for name in ('goal_delta','ball_delta','approach_delta','best_ball','best_approach',
-                 'strike_delta','shot_speed_delta','best_shot_speed'):
+                 'strike_delta','shot_speed_delta','best_shot_speed','down_steps','fall_delta'):
         getattr(term,name)[env_ids] = 0
     robot_xy = origin[:,:2].clone()
-    robot_xy[:,0] -= .38
+    robot_xy[:,0] -= robot_spawn_x
     local_ball = ball_pose[:,:2]-origin[:,:2]
+    if term.cfg.aim == 'open':
+        term.aim_xy[env_ids],term.aim_side[env_ids] = arena_open_aim(
+            local_ball,opponent_local,torch.zeros(n,dtype=torch.long,device=env.device))
+    else:
+        term.aim_xy[env_ids] = torch.tensor([.9,0.],device=env.device)
     term.initial_distance[env_ids] = torch.linalg.vector_norm(
-        arena_kick_stance(local_ball)-(robot_xy-origin[:,:2]),dim=-1)
+        arena_kick_stance(local_ball,term.aim_xy[env_ids])-(robot_xy-origin[:,:2]),dim=-1)
     target = torch.zeros_like(local_ball)
     target[:,0] = .9
     term.initial_goal_distance[env_ids] = torch.linalg.vector_norm(target-local_ball,dim=-1)
@@ -7923,7 +8114,8 @@ def arena_fallen_penalty(env):
 def arena_goal_done(env):
     term = env.command_manager.get_term('twist')
     term.update_match()
-    return term.scored | term.conceded
+    hold = round(term.cfg.goal_hold_s/env.step_dt)
+    return (term.scored | term.conceded) & (term.goal_steps > hold)
 
 
 def arena_progress(env,component):
@@ -7937,6 +8129,11 @@ def arena_metric(env,name):
     term.update_match()
     if name == 'standing':
         return arena_upright(env).float()
+    if name.startswith('mode_') or '_vs_' in name:
+        # mode_<m>: share of rounds; <flag>_vs_<m>: flag AND mode. Rate = flag_vs_m / mode_m.
+        flag,_,which = name.rpartition('_vs_') if '_vs_' in name else ('',None,name[5:])
+        hit = arena_opponent_mode(env) == ARENA_OPPONENT_MODES.index(which)
+        return (hit & getattr(term,flag)).float() if flag else hit.float()
     return getattr(term,name).float()
 
 
@@ -7947,10 +8144,12 @@ def arena_opponent_state(env):
                                       opponent.root_link_lin_vel_w),dim=-1))
 
 
-def arena_kick_stance(ball_xy):
-    """Right-foot stance behind the ball, aligned with the opponent goal mouth."""
-    goal = torch.zeros_like(ball_xy)
-    goal[:,0] = .9
+def arena_kick_stance(ball_xy,aim_xy=None):
+    """Right-foot stance behind the ball, aligned with the aim point (default: goal center)."""
+    if aim_xy is None:
+        aim_xy = torch.zeros_like(ball_xy)
+        aim_xy[:,0] = .9
+    goal = aim_xy
     direction = torch.nn.functional.normalize(goal-ball_xy,dim=-1)
     lateral = torch.stack((-direction[:,1],direction[:,0]),dim=-1)
     return ball_xy-.10*direction+.042*lateral
@@ -7968,11 +8167,29 @@ def arena_supported_strike(env):
     return kick.found.flatten(1).any(1) & support.found.flatten(1).any(1)
 
 
-def arena_timeout_penalty(env):
+def arena_ball_out(env):
+    """Whole ball over a side line, or over a goal line anywhere but through the mouth."""
     term = env.command_manager.get_term('twist')
     term.update_match()
-    timeout = (env.episode_length_buf >= env.max_episode_length) & ~term.scored & ~term.conceded
-    return timeout.float()/env.step_dt
+    ball = env.scene['ball'].data.root_link_pos_w[:,:2]-env.scene.terrain.env_origins[:,:2]
+    side = ball[:,1].abs() > .685
+    ends = ((ball[:,0] > .935) & ~term.scored) | ((ball[:,0] < -.935) & ~term.conceded)
+    return side | ends
+
+
+def arena_timeout_penalty(env,include_ball_out=False):
+    """One-time cost for a round ending without a goal (timeout, optionally ball out)."""
+    term = env.command_manager.get_term('twist')
+    term.update_match()
+    dead = env.episode_length_buf >= env.max_episode_length
+    if include_ball_out:
+        dead = dead | arena_ball_out(env)
+    return (dead & ~term.scored & ~term.conceded).float()/env.step_dt
+
+
+def arena_opponent_mode_obs(env):
+    """Critic-only one-hot (solo, keeper, attacker): how hard this arena is."""
+    return torch.nn.functional.one_hot(arena_opponent_mode(env),len(ARENA_OPPONENT_MODES)).float()
 
 
 def arena_time_remaining(env):

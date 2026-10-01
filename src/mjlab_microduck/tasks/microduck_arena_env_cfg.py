@@ -81,3 +81,82 @@ MicroduckArenaRlCfg.max_iterations = 5000
 
 # At 50 Hz, gamma=.997 gives a ~6.7 s credit horizon (old .99: ~2 s).
 MicroduckArenaRlCfg.algorithm.gamma = .997
+
+
+# --- kick-first-v3 --------------------------------------------------------------
+# Built from the 2026-09-30 shot-outcome eval (scripts/eval_arena_shots.py). v2 lost the
+# source kick (1.1 -> 0.3 m/s, aim 8 -> 16 deg; solo goals 83% -> 37%). Its rounds were
+# decided by ~2 s and then ran dead (ball out of play at 10 s in 89% of rounds). Against
+# an attacker, outcomes were close to random (kickoff scrum), so the kick got no clean
+# credit. v3 starts from the football kicker, ends dead rounds and prices a fall once.
+# It stages opponents so kicking is learned before contesting: empty goal, keeper, attacker.
+V3_RECIPE = 'kick-first-v3'
+ENABLE_V3_BALL_OUT_ENDS_ROUND = True
+ENABLE_V3_OPEN_AIM = True
+V3_FALL_COST = 10.0  # Once per fall (0.2 s down); v2 charged 5/s for the rest of the round.
+V3_DEAD_ROUND_COST = TIMEOUT_COST  # Timeout or ball out without a goal, once.
+# (solo, keeper, attacker) opponent probabilities; env steps = iteration * 24.
+V3_MODE_STAGES = [
+    {'step': 0, 'probs': (1., 0., 0.)},
+    {'step': 250*24, 'probs': (.4, .6, 0.)},
+    {'step': 750*24, 'probs': (.2, .4, .4)},
+    {'step': 1250*24, 'probs': (.15, .35, .5)},
+]
+
+
+def make_microduck_arena_v3_env_cfg(play=False,rough=False):
+    cfg = make_microduck_arena_env_cfg(play=play,rough=rough)
+    cfg.events['reset_arena'].params['mode_stages'] = deepcopy(V3_MODE_STAGES)
+    cfg.commands['twist'].aim = 'open' if ENABLE_V3_OPEN_AIM else 'center'
+    del cfg.rewards['arena_fallen']
+    cfg.rewards['arena_fall_event'] = RewardTermCfg(func=mdp.arena_progress,weight=-V3_FALL_COST,
+        params={'component':'fall_delta'})  # fall_delta >= 0: negative weight.
+    cfg.rewards['arena_timeout'] = RewardTermCfg(func=mdp.arena_timeout_penalty,weight=-V3_DEAD_ROUND_COST,
+        params={'include_ball_out':ENABLE_V3_BALL_OUT_ENDS_ROUND})
+    if ENABLE_V3_BALL_OUT_ENDS_ROUND:
+        cfg.terminations['arena_ball_out'] = TerminationTermCfg(func=mdp.arena_ball_out)
+    cfg.observations['critic'].terms['opponent_mode'] = ObservationTermCfg(func=mdp.arena_opponent_mode_obs)
+    for mode in mdp.ARENA_OPPONENT_MODES:
+        cfg.metrics[f'arena_mode_{mode}'] = MetricsTermCfg(func=mdp.arena_metric,
+            params={'name':f'mode_{mode}'},reduce='last')
+        cfg.metrics[f'arena_scored_vs_{mode}'] = MetricsTermCfg(func=mdp.arena_metric,
+            params={'name':f'scored_vs_{mode}'},reduce='last')
+    return cfg
+
+
+MicroduckArenaV3RlCfg = deepcopy(MicroduckArenaRlCfg)
+MicroduckArenaV3RlCfg.experiment_name = 'football_arena_v3'
+MicroduckArenaV3RlCfg.run_name = 'kick-first'
+MicroduckArenaV3RlCfg.max_iterations = 2000
+
+
+# --- keeper-v1: the learner defends -----------------------------------------------
+# The learner keeps its own (-x) goal via the keeper tracker (mdp.arena_keeper_command) against
+# a frozen attacker (use train_arena.py --no-self-play). The scripted keeper made from the
+# football actor fell ~15-20% of the time under keeper commands; this trains that walking.
+KEEPER_RECIPE = 'keeper-v1'
+KEEPER_CLEAN_ROUND_REWARD = 5.0  # Once: timeout or ball out without conceding.
+KEEPER_FALL_COST = V3_FALL_COST
+
+
+def make_microduck_arena_keeper_env_cfg(play=False,rough=False):
+    cfg = make_microduck_arena_env_cfg(play=play,rough=rough)
+    cfg.commands['twist'].role = 'keeper'
+    cfg.events['reset_arena'].params['mode_stages'] = [{'step':0,'probs':(0.,0.,1.)}]
+    for name in ('arena_approach_delta','arena_ball_delta','arena_strike_delta','arena_shot_speed_delta','arena_fallen'):
+        del cfg.rewards[name]
+    # goal_delta keeps weight GOAL_REWARD: a conceded goal is -100 (a keeper goal would be +100).
+    cfg.rewards['arena_timeout'] = RewardTermCfg(func=mdp.arena_timeout_penalty,weight=KEEPER_CLEAN_ROUND_REWARD,
+        params={'include_ball_out':True})  # Positive here: surviving the round is the keeper's success.
+    cfg.rewards['arena_fall_event'] = RewardTermCfg(func=mdp.arena_progress,weight=-KEEPER_FALL_COST,
+        params={'component':'fall_delta'})
+    cfg.terminations['arena_ball_out'] = TerminationTermCfg(func=mdp.arena_ball_out)
+    cfg.metrics = {f'arena_{name}':MetricsTermCfg(func=mdp.arena_metric,params={'name':name},reduce='last')
+                   for name in ('scored','conceded','standing')}
+    return cfg
+
+
+MicroduckArenaKeeperRlCfg = deepcopy(MicroduckArenaRlCfg)
+MicroduckArenaKeeperRlCfg.experiment_name = 'football_arena_keeper'
+MicroduckArenaKeeperRlCfg.run_name = 'keeper'
+MicroduckArenaKeeperRlCfg.max_iterations = 1500
