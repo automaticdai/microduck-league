@@ -8194,3 +8194,18 @@ def arena_opponent_mode_obs(env):
 
 def arena_time_remaining(env):
     return (1-env.episode_length_buf.float()/env.max_episode_length).clamp(0,1)[:,None]
+
+
+def feet_only_support_gated(env, inner, inner_params, sensor_name="non_foot_ground"):
+    """inner(env, **inner_params), paid only while no body but the feet touches the ground.
+
+    Goal-state rewards must not pay a pose propped on the head or trunk (the StandUp head-tripod).
+    Contact is checked across all physics substeps of the control step.
+    """
+    data = env.scene.sensors[sensor_name].data
+    history = getattr(data, "force_history", None)
+    if history is not None:
+        touching = torch.nan_to_num(history).abs().sum(-1).flatten(1).gt(1e-6).any(-1)
+    else:
+        touching = data.found.flatten(1).gt(0).any(-1)
+    return inner(env, **inner_params) * (~touching).float()

@@ -40,6 +40,9 @@ def main():
     parser.add_argument('--warmup-lr',type=float,default=1e-3,help='Fixed critic learning rate during warm-up')
     parser.add_argument('--mode-probs',type=float,nargs=3,metavar=('SOLO','KEEPER','ATTACKER'),
                         help='Replace the opponent-mode schedule with one fixed mix')
+    parser.add_argument('--keeper-policy',type=Path,help='Frozen policy for keeper-mode opponents (default: --opponent-policy)')
+    parser.add_argument('--keeper-max-speed',type=float,nargs=4,metavar=('BACK','FWD','SIDE','YAW'),
+                        help='Keeper command limits (a learned keeper wants its training limits)')
     parser.add_argument('--no-self-play',action='store_true',help='Every opponent is the fixed --opponent-policy')
     parser.add_argument('--eval-every',type=int,default=0,help='Evaluate checkpoints against the fixed opponent every N iterations')
     parser.add_argument('--num-envs',type=int,default=64)
@@ -52,6 +55,8 @@ def main():
         parser.error('Environment count, iterations and opponent update interval must be positive')
     cfg,agent = load_env_cfg(args.task),load_rl_cfg(args.task)
     cfg.scene.num_envs = args.num_envs
+    if args.keeper_max_speed:
+        cfg.actions['joint_pos'].keeper_max_speed = tuple(args.keeper_max_speed)
     if args.mode_probs:
         if abs(sum(args.mode_probs)-1) > 1e-6:
             parser.error('--mode-probs must sum to 1')
@@ -75,6 +80,10 @@ def main():
         runner.load(str(args.from_policy),load_cfg={'actor':True},map_location='cuda:0')
         baseline = deepcopy(runner.alg.actor).eval().requires_grad_(False)
         opponent = deepcopy(baseline).eval().requires_grad_(False)
+        keeper_policy = baseline
+        if args.keeper_policy:
+            keeper_policy = deepcopy(baseline)
+            keeper_policy.load_state_dict(torch.load(args.keeper_policy,map_location='cuda:0',weights_only=False)['actor_state_dict'])
         if args.opponent_policy:
             baseline.load_state_dict(torch.load(args.opponent_policy,map_location='cuda:0',weights_only=False)['actor_state_dict'])
         if args.resume:
@@ -93,8 +102,12 @@ def main():
                 return baseline(obs)
             # Keeper and solo arenas always walk with the fixed reference policy (keeper was
             # validated with it); attackers alternate between reference and self-play snapshot.
-            use_self = ~mask & (mdp.arena_opponent_mode(env) == mdp.ATTACKER)[:,None] & (not args.no_self_play)
-            return torch.where(use_self,opponent(obs),baseline(obs))
+            mode = mdp.arena_opponent_mode(env)[:,None]
+            use_self = ~mask & (mode == mdp.ATTACKER) & (not args.no_self_play)
+            action = torch.where(use_self,opponent(obs),baseline(obs))
+            if args.keeper_policy:
+                action = torch.where(mode == mdp.KEEPER,keeper_policy(obs),action)
+            return action
         env.arena_opponent_policy = opponent_policy
         original_save = runner.save
         last_refresh = runner.current_learning_iteration

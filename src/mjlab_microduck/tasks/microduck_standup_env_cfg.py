@@ -99,6 +99,17 @@ STAND_Z = 0.115
 # reward, no body-control curricula (including the conflict-relax stages on
 # height_stand_sharp / upright_sharp / standing_composite).
 ENABLE_BODY_CONTROL = True
+
+# Ground-support gate (2026-10-01). Face-down recoveries converged to a head-tripod:
+# head planted, neck folded 1.9 rad, trunk pitched ~35 deg on straight legs at
+# STAND_Z. That collected most of the goal-state rewards, so only 10% of face-down
+# starts ended upright and 0% of face-up. With the gate on, the goal-state terms
+# below pay only while nothing but the feet touches the ground. Bootstrap terms
+# (wide height, upright_linear, com_upward_velocity) stay ungated so the rise,
+# which needs hands and head on the floor, still gets a gradient.
+ENABLE_GROUND_SUPPORT_GATE = True
+GROUND_SUPPORT_GATED_REWARDS = ("height_stand_sharp", "upright_sharp", "standing_composite", "pose_stand_legs",
+                                "body_pose_tracking")  # Late-stage standing attractor (ENABLE_BODY_CONTROL).
 # 6D command slot [x, y, z, roll, pitch, yaw] for obs parity with velocity/
 # velstand, but only z/roll/pitch are tracked (axis_weights below) — the same
 # 3 axes as the original standup body control and the runtime interface.
@@ -1114,6 +1125,21 @@ def make_microduck_standup_env_cfg(
         },
     )
 
+    if ENABLE_GROUND_SUPPORT_GATE:
+        cfg.scene.sensors = (*cfg.scene.sensors, ContactSensorCfg(
+            name="non_foot_ground",
+            primary=ContactMatch(mode="body", pattern="^(?!ankle_left$|ankle_right$).*", entity="robot"),
+            secondary=ContactMatch(mode="body", pattern="terrain"),
+            fields=("found", "force"), reduce="netforce", num_slots=1, history_length=cfg.decimation,
+        ))
+        for name in GROUND_SUPPORT_GATED_REWARDS:
+            if name not in cfg.rewards:
+                continue
+            term = cfg.rewards[name]
+            cfg.rewards[name] = RewardTermCfg(
+                func=microduck_mdp.feet_only_support_gated, weight=term.weight,
+                params={"inner": term.func, "inner_params": term.params, "sensor_name": "non_foot_ground"},
+            )
     return cfg
 
 
