@@ -5,6 +5,8 @@ The actor remains 61D; the critic additionally observes the opponent. No fall or
 out-of-bounds termination: only goals, timeout, and numerical-safety failures.
 """
 from copy import deepcopy
+import mujoco
+from mjlab.entity import EntityCfg
 from mjlab.managers import EventTermCfg, ObservationTermCfg, RewardTermCfg, TerminationTermCfg
 from mjlab.managers.metrics_manager import MetricsTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
@@ -22,6 +24,28 @@ SUPPORT_REWARD_WEIGHTS = {
     'track_linear_velocity': .20, 'track_angular_velocity': .10,
     'upright': .30, 'pose': .10, 'head_pose_tracking': .10, 'air_time': 0.,
 }
+
+
+# Low boards around the pitch: side lines plus end lines beside each goal (goal + net close the
+# mouth). (x, y, half-x, half-y) of each box; the ball stays in play instead of rolling away.
+BOARD_HEIGHT = .08
+ARENA_BOARDS = ((0,.665,.945,.005),(0,-.665,.945,.005),
+                (.94,.44,.005,.23),(.94,-.44,.005,.23),(-.94,.44,.005,.23),(-.94,-.44,.005,.23))
+
+
+def get_arena_boards_spec():
+    spec = mujoco.MjSpec()
+    body = spec.worldbody.add_body(name='boards',mocap=True)  # Moved to each arena origin by reset_arena.
+    for i,(x,y,sx,sy) in enumerate(ARENA_BOARDS):
+        body.add_geom(name=f'board_{i}',type=mujoco.mjtGeom.mjGEOM_BOX,pos=[x,y,BOARD_HEIGHT/2],
+                      size=[sx,sy,BOARD_HEIGHT/2],rgba=[.95,.95,.95,.9],contype=1,conaffinity=1)
+    return spec
+
+
+def add_arena_boards(cfg):
+    """Opt-in: collide the ball and ducks with pitch boards (changes the task; off by default)."""
+    cfg.scene.entities['boards'] = EntityCfg(spec_fn=get_arena_boards_spec)
+    return cfg
 
 
 def make_microduck_arena_env_cfg(play=False,rough=False):
@@ -142,6 +166,7 @@ KEEPER_FALL_COST = V3_FALL_COST
 def make_microduck_arena_keeper_env_cfg(play=False,rough=False):
     cfg = make_microduck_arena_env_cfg(play=play,rough=rough)
     cfg.commands['twist'].role = 'keeper'
+    cfg.actions['joint_pos'].opponent_aim = 'open'  # Train against the shots the eval/attacker policy takes.
     cfg.events['reset_arena'].params['mode_stages'] = [{'step':0,'probs':(0.,0.,1.)}]
     for name in ('arena_approach_delta','arena_ball_delta','arena_strike_delta','arena_shot_speed_delta','arena_fallen'):
         del cfg.rewards[name]

@@ -7834,11 +7834,26 @@ class ArenaJointPositionAction(JointPositionAction):
         self.opponent = JointPositionAction(JointPositionActionCfg(
             entity_name='opponent', actuator_names=('^(?!passive_).*',),scale=1.0),env)
         self.opponent_velocity = torch.zeros_like(self._raw_actions)
+        if cfg.opponent_aim not in ('center','open'):
+            raise ValueError(f'Unknown opponent aim: {cfg.opponent_aim}')
+        self.opponent_aim_side = torch.zeros(env.num_envs,dtype=torch.long,device=env.device)
+
+    def opponent_attack_command(self):
+        """Opponent attacks -x. Open aim mirrors the field (x,y)->(-x,-y) so arena_open_aim's +x
+        geometry applies, with the learner as the blocker, then mirrors the aim point back."""
+        env = self._env
+        if self.cfg.opponent_aim != 'open':
+            return arena_navigation(env,'opponent',-1)
+        origin = env.scene.terrain.env_origins[:,:2]
+        ball = env.scene['ball'].data.root_link_pos_w[:,:2]-origin
+        robot = env.scene['robot'].data.root_link_pos_w[:,:2]-origin
+        aim,self.opponent_aim_side[:] = arena_open_aim(-ball,-robot,self.opponent_aim_side)
+        return arena_navigation(env,'opponent',-1,-aim)
 
     def opponent_command(self):
         """Attacker: attack tracker. Keeper: arena_keeper_navigation. Solo: exact-zero idle, parked off-pitch."""
         mode = arena_opponent_mode(self._env)
-        command = arena_navigation(self._env,'opponent',-1)
+        command = self.opponent_attack_command()
         keeper = mode == KEEPER
         if keeper.any():
             command = torch.where(keeper[:,None],arena_keeper_navigation(self._env,'opponent',1,
@@ -7878,6 +7893,7 @@ class ArenaJointPositionActionCfg(JointPositionActionCfg):
     keeper_distance: float = .2  # Keeper spot and spawn: this far in front of its goal center.
     keeper_clear_radius: float = 0.
     keeper_max_speed: tuple[float,float,float,float] = (.15,.25,.12,.5)  # back, fwd, side, yaw rate
+    opponent_aim: str = 'center'  # 'open': the attacking opponent aims beside the learner's shadow
 
     def build(self,env):
         return ArenaJointPositionAction(self,env)
@@ -8075,6 +8091,11 @@ def reset_arena(env,env_ids,mode_stages=None):
         pose[:,0] += sign*.9
         pose[:,3 if sign == 1 else 6] = 1
         env.scene[name].write_mocap_pose_to_sim(pose,env_ids)
+    if 'boards' in env.scene.entities:  # Mocap, like the goals: one set per arena origin.
+        pose = torch.zeros(n,7,device=env.device)
+        pose[:,:3] = origin
+        pose[:,3] = 1
+        env.scene['boards'].write_mocap_pose_to_sim(pose,env_ids)
     term = env.command_manager.get_term('twist')
     term.previous_ball[env_ids] = ball_pose[:,:3]
     term.scored[env_ids] = False

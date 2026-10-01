@@ -24,7 +24,7 @@ from mjlab_microduck.robot.microduck_constants import get_standup_spec
 TASK = 'Mjlab-FootballArena-Flat-MicroDuck'
 
 
-BOARD_HEIGHT = .08
+from mjlab_microduck.tasks.microduck_arena_env_cfg import ARENA_BOARDS, BOARD_HEIGHT
 
 
 def pitch_spec(boards=False):
@@ -45,10 +45,7 @@ def pitch_spec(boards=False):
     if boards:
         # Low boards: side lines, plus end lines beside each goal (the goal and net close the mouth).
         h = BOARD_HEIGHT/2
-        walls = [(0,.665,.945,.005),(0,-.665,.945,.005)]
-        for x in (.94,-.94):
-            walls += [(x,.44,.005,.23),(x,-.44,.005,.23)]
-        for i,(x,y,sx,sy) in enumerate(walls):
+        for i,(x,y,sx,sy) in enumerate(ARENA_BOARDS):
             body.add_geom(name=f'board_{i}',type=mujoco.mjtGeom.mjGEOM_BOX,pos=[x,y,h],size=[sx,sy,h],
                           rgba=[.95,.95,.95,.9],contype=1,conaffinity=1)
     return spec

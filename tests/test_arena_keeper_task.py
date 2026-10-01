@@ -24,3 +24,23 @@ def test_learner_keeper_command_defends_minus_x():
     assert cmd.tolist() == [[0., 0., 0.]]  # On its spot, facing +x at the ball: idle.
     back = mdp.arena_keeper_command(torch.tensor([[-.5, 0.]]), torch.tensor([0.]), torch.tensor([[0., 0.]]), goal, -1)
     assert back[0, 0] < 0  # Backs toward its goal.
+
+
+def test_opponent_open_aim_is_mirrored_and_keeper_task_uses_it():
+    import torch
+    cfg = make_microduck_arena_keeper_env_cfg()
+    assert cfg.actions['joint_pos'].opponent_aim == 'open'
+    assert make_microduck_arena_env_cfg().actions['joint_pos'].opponent_aim == 'center'
+    # Mirror check: a blocker left of the -x goal's line (from the attacker's view) sends the aim right.
+    ball, keeper = torch.tensor([[0., 0.]]), torch.tensor([[-.7, -.06]])
+    aim, side = mdp.arena_open_aim(-ball, -keeper, torch.tensor([0]))
+    aim = -aim
+    assert aim[0, 0] < -.9 and aim[0, 1] > 0  # On the -x goal line, away from the keeper (y<0).
+
+
+def test_boards_option_adds_colliding_entity():
+    from mjlab_microduck.tasks.microduck_arena_env_cfg import add_arena_boards, get_arena_boards_spec, ARENA_BOARDS
+    cfg = add_arena_boards(make_microduck_arena_env_cfg())
+    assert 'boards' in cfg.scene.entities and 'boards' not in make_microduck_arena_env_cfg().scene.entities
+    geoms = get_arena_boards_spec().worldbody.first_body().geoms
+    assert len(geoms) == len(ARENA_BOARDS) and all(g.contype == 1 and g.conaffinity == 1 for g in geoms)

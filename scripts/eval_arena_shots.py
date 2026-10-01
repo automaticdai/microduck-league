@@ -58,6 +58,10 @@ def build_env(args):
     mode = 'solo' if args.solo else args.opponent_role
     cfg.events['reset_arena'].params['mode_stages'] = [{'step': 0, 'probs': probs[mode]}]
     cfg.commands['twist'].aim = args.aim
+    cfg.actions['joint_pos'].opponent_aim = getattr(args, 'opponent_aim', 'center')
+    if getattr(args, 'boards', False):
+        from mjlab_microduck.tasks.microduck_arena_env_cfg import add_arena_boards
+        add_arena_boards(cfg)
     cfg.commands['twist'].post_strike_settle_s = args.settle
     cfg.actions['joint_pos'].keeper_distance = args.keeper_distance
     cfg.actions['joint_pos'].keeper_clear_radius = args.keeper_clear_radius
@@ -80,6 +84,8 @@ def main():
     parser.add_argument('--keeper-max-speed', type=float, nargs=4, default=(.15, .25, .12, .5),
                         metavar=('BACK', 'FWD', 'SIDE', 'YAW'))
     parser.add_argument('--seed', type=int, default=7)
+    parser.add_argument('--boards', action='store_true', help='Pitch boards keep the ball in play (task change)')
+    parser.add_argument('--opponent-aim', choices=('center', 'open'), default='center')
     parser.add_argument('--settle', type=float, default=0., help='Zero command for this long after each supported strike')
     parser.add_argument('--getup-policy', type=Path,
                         help='StandUp checkpoint hot-swapped in after 0.2 s down, until 0.5 s upright (runtime-style)')
