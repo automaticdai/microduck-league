@@ -302,6 +302,15 @@ for _task_id, _make_cfg, _kw, _rl_cfg, _robot_cfg in _BACKLASH_TASKS:
 from .microduck_arena_env_cfg import (make_microduck_arena_env_cfg, MicroduckArenaRlCfg,
                                       make_microduck_arena_v3_env_cfg, MicroduckArenaV3RlCfg,
                                       make_microduck_arena_keeper_env_cfg, MicroduckArenaKeeperRlCfg)
+from .microduck_arena_teams_env_cfg import make_microduck_arena_teams_env_cfg, MicroduckArenaTeamsRlCfg
+
+register_mjlab_task(
+    task_id='Mjlab-FootballArena-3v3-Flat-MicroDuck',
+    env_cfg=make_microduck_arena_teams_env_cfg(),
+    play_env_cfg=make_microduck_arena_teams_env_cfg(play=True),
+    rl_cfg=MicroduckArenaTeamsRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
 register_mjlab_task(
     task_id='Mjlab-FootballArena-Flat-MicroDuck',
     env_cfg=make_microduck_arena_env_cfg(),

@@ -12,6 +12,48 @@ supplies navigation commands. The actor has no explicit opponent-position
 input; the training critic additionally observes opponent position/velocity.
 This is a first competition recipe, not yet evidence of learned tactics.
 
+## Three-a-side arena
+
+`Mjlab-FootballArena-3v3-Flat-MicroDuck` places six independently actuated ducks on
+the existing 1.8 × 1.3 m pitch: two attackers and one goal-line defender per team.
+Both teams share one ball. Boards keep it in play; goals and 10-second timeouts
+reset all six players to mirrored formations. Numerical failures also reset the round.
+Attackers use the ball tracker and aim beside the opposing defender; defenders use
+the existing keeper tracker and a separately loaded keeper policy. These are fixed
+roles using existing policies, not newly learned passing or coordinated tactics.
+
+Replay with team-colored goals, floating triangles, and role labels:
+
+```bash
+uv run scripts/play_football_arena_gpu.py --teams \
+  --checkpoint path/to/attacker/model_4699.pt \
+  --defender-policy path/to/keeper/model_2699.pt \
+  --compile-friction --port 8081
+```
+
+The same attacker checkpoint controls all four attackers unless `--opponent-policy`
+selects a different checkpoint for the two orange attackers. Both defenders use
+`--defender-policy`. Open-gap aiming is always enabled in 3v3.
+
+Training updates only the primary blue attacker; its blue teammate and both
+defenders stay frozen. Orange attackers use the existing fixed-reference/self-play
+selection. Each player retains its own action and velocity history. The actor
+remains 61D with 14 actions; the critic additionally sees all five other players.
+The learner inherits the base arena's DR, observation noise, BAM actuators and
+reward stack; teammates and opponents use clean inference observations.
+
+```bash
+# Required smoke test before any longer training run.
+uv run scripts/train_arena.py --task Mjlab-FootballArena-3v3-Flat-MicroDuck \
+  --from-policy path/to/attacker/model_4699.pt \
+  --keeper-policy path/to/keeper/model_2699.pt \
+  --num-envs 64 --iterations 5 --run-name 3v3-smoke
+```
+
+For sustained fine-tuning, use `--critic-warmup` as with the other arena tasks.
+The 3v3 task has its own `football_arena_3v3` experiment directory and requires
+`--keeper-policy`. It does not support the two-player `--mode-probs` switch.
+
 ## Train on a CUDA server
 
 Run these from the repository root after `uv sync --locked`:

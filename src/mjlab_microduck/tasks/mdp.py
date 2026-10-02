@@ -8217,6 +8217,151 @@ def arena_time_remaining(env):
     return (1-env.episode_length_buf.float()/env.max_episode_length).clamp(0,1)[:,None]
 
 
+# Three-a-side arena: two attackers and one goal-line defender on each team.
+# Names preserve the original learner/opponent pair for rewards and self-play.
+ARENA_TEAM_PLAYERS = {
+    'robot': (1, 'attacker'),
+    'blue_attacker': (1, 'attacker'),
+    'blue_defender': (1, 'defender'),
+    'opponent': (-1, 'attacker'),
+    'orange_attacker': (-1, 'attacker'),
+    'orange_defender': (-1, 'defender'),
+}
+ARENA_TEAM_SPAWNS = {
+    'robot': (-.38, -.26), 'blue_attacker': (-.38, .26), 'blue_defender': (-.7, 0.),
+    'opponent': (.38, .26), 'orange_attacker': (.38, -.26), 'orange_defender': (.7, 0.),
+}
+
+
+def arena_team_navigation(env, name, previous_side):
+    """Use the opposing defender's shadow for attack aim, mirrored for orange."""
+    sign, role = ARENA_TEAM_PLAYERS[name]
+    if role == 'defender':
+        cfg = env.action_manager.get_term('joint_pos').cfg
+        return arena_keeper_navigation(env,name,-sign,cfg.keeper_distance,
+                                       0.,cfg.keeper_max_speed), None
+    origin = env.scene.terrain.env_origins[:,:2]
+    blocker = 'orange_defender' if sign == 1 else 'blue_defender'
+    aim,side = arena_open_aim(
+        sign*(env.scene['ball'].data.root_link_pos_w[:,:2]-origin),
+        sign*(env.scene[blocker].data.root_link_pos_w[:,:2]-origin),previous_side)
+    previous_side[:] = side
+    aim = sign*aim
+    return arena_navigation(env,name,sign,aim), aim
+
+
+class ArenaTeamCommand(ArenaCommand):
+    def _update_command(self):
+        command,aim = arena_team_navigation(self._env,'robot',self.aim_side)
+        self._command[:] = command
+        self.aim_xy[:] = aim
+
+
+@dataclass(kw_only=True)
+class ArenaTeamCommandCfg(ArenaCommandCfg):
+    def build(self,env):
+        return ArenaTeamCommand(self,env)
+
+
+class ArenaTeamJointPositionAction(JointPositionAction):
+    """One 14D learner plus five independent frozen actors with per-player history."""
+    def __init__(self,cfg,env):
+        super().__init__(cfg,env)
+        self.players = {
+            name: JointPositionAction(JointPositionActionCfg(
+                entity_name=name,actuator_names=('^(?!passive_).*',),scale=1.),env)
+            for name in ARENA_TEAM_PLAYERS if name != 'robot'
+        }
+        self.velocities = {name:torch.zeros_like(self._raw_actions) for name in self.players}
+        self.aim_sides = {name:torch.zeros(env.num_envs,dtype=torch.long,device=env.device)
+                          for name in self.players}
+
+    def process_actions(self,actions):
+        super().process_actions(actions)
+        env = self._env
+        for name,action in self.players.items():
+            sign,role = ARENA_TEAM_PLAYERS[name]
+            if role == 'defender':
+                policy = getattr(env,'arena_defender_policy',None)
+            elif sign == 1:
+                policy = getattr(env,'arena_teammate_policy',None)
+            else:
+                policy = getattr(env,'arena_opponent_policy',None)
+            if policy is None:
+                raise RuntimeError('3v3 requires attacker, teammate and defender policies; '
+                                   'use scripts/train_arena.py or play_football_arena_gpu.py --teams')
+            asset = env.scene[name]
+            data = asset.data
+            ids = _servo_joint_ids(env,asset)
+            command,_ = arena_team_navigation(env,name,self.aim_sides[name])
+            obs = torch.cat((data.root_link_ang_vel_b,data.projected_gravity_b,
+                data.joint_pos[:,ids]-data.default_joint_pos[:,ids],self.velocities[name],
+                action.raw_action,command,torch.zeros(env.num_envs,10,device=env.device)),dim=-1)
+            self.velocities[name][:] = data.joint_vel[:,ids]
+            with torch.no_grad():
+                action.process_actions(policy({'actor':torch.nan_to_num(obs)}))
+
+    def apply_actions(self):
+        super().apply_actions()
+        for action in self.players.values():
+            action.apply_actions()
+
+    def reset(self,env_ids=None):
+        super().reset(env_ids)
+        for name,action in self.players.items():
+            action.reset(env_ids)
+            self.velocities[name][env_ids] = 0
+            self.aim_sides[name][env_ids] = 0
+
+
+@dataclass(kw_only=True)
+class ArenaTeamJointPositionActionCfg(ArenaJointPositionActionCfg):
+    keeper_max_speed: tuple[float,float,float,float] = (.2,.3,.15,.75)
+
+    def build(self,env):
+        return ArenaTeamJointPositionAction(self,env)
+
+
+def reset_arena_teams(env,env_ids):
+    """Mirrored, separated formations; reset all six players and the shared match."""
+    reset_arena(env,env_ids)
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs,device=env.device)
+    origin = env.scene.terrain.env_origins[env_ids]
+    n = len(env_ids)
+    for name,(x,y) in ARENA_TEAM_SPAWNS.items():
+        sign,role = ARENA_TEAM_PLAYERS[name]
+        if role == 'defender':
+            x = -sign*(.9-env.action_manager.get_term('joint_pos').cfg.keeper_distance)
+        asset = env.scene[name]
+        pose = torch.zeros(n,7,device=env.device)
+        pose[:,:3] = origin+torch.tensor([x,y,.125],device=env.device)
+        pose[:,3 if sign == 1 else 6] = 1
+        asset.write_root_link_pose_to_sim(pose,env_ids)
+        asset.write_root_link_velocity_to_sim(torch.zeros(n,6,device=env.device),env_ids)
+        asset.write_joint_state_to_sim(asset.data.default_joint_pos[env_ids],
+            torch.zeros_like(asset.data.default_joint_pos[env_ids]),env_ids=env_ids)
+    # Reward baselines must use the new formation, not the inherited 1v1 spawn.
+    term = env.command_manager.get_term('twist')
+    ball = term.previous_ball[env_ids,:2]-origin[:,:2]
+    blocker = torch.zeros_like(ball)
+    blocker[:,0] = .9-env.action_manager.get_term('joint_pos').cfg.keeper_distance
+    term.aim_xy[env_ids],term.aim_side[env_ids] = arena_open_aim(
+        ball,blocker,torch.zeros(n,dtype=torch.long,device=env.device))
+    robot_xy = torch.tensor(ARENA_TEAM_SPAWNS['robot'],device=env.device)
+    term.initial_distance[env_ids] = (arena_kick_stance(ball,term.aim_xy[env_ids])-robot_xy).norm(dim=-1)
+
+
+def arena_team_state(env):
+    """Critic-only relative positions and velocities of the other five players."""
+    robot = env.scene['robot'].data
+    return torch.nan_to_num(torch.cat([
+        torch.cat((env.scene[name].data.root_link_pos_w-robot.root_link_pos_w,
+                   env.scene[name].data.root_link_lin_vel_w),dim=-1)
+        for name in ARENA_TEAM_PLAYERS if name != 'robot'
+    ],dim=-1))
+
+
 def feet_only_support_gated(env, inner, inner_params, sensor_name="non_foot_ground"):
     """inner(env, **inner_params), paid only while no body but the feet touches the ground.
 

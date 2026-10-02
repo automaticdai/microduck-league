@@ -23,10 +23,12 @@ import mjlab_microduck.tasks  # noqa
 from mjlab_microduck.tasks import mdp
 
 from mjlab_microduck.tasks import microduck_arena_env_cfg as arena_cfg
+from mjlab_microduck.tasks import microduck_arena_teams_env_cfg as teams_cfg
 
 RECIPES = {'Mjlab-FootballArena-Flat-MicroDuck': arena_cfg.REWARD_RECIPE,
            'Mjlab-FootballArena-V3-Flat-MicroDuck': arena_cfg.V3_RECIPE,
-           'Mjlab-FootballArena-Keeper-Flat-MicroDuck': arena_cfg.KEEPER_RECIPE}
+           'Mjlab-FootballArena-Keeper-Flat-MicroDuck': arena_cfg.KEEPER_RECIPE,
+           'Mjlab-FootballArena-3v3-Flat-MicroDuck': teams_cfg.REWARD_RECIPE}
 
 
 def main():
@@ -52,6 +54,11 @@ def main():
     parser.add_argument('--run-name',default='arena-smoke')
     parser.add_argument('--evaluate-seconds',type=float,default=0)
     args = parser.parse_args()
+    teams = args.task == 'Mjlab-FootballArena-3v3-Flat-MicroDuck'
+    if teams and args.mode_probs:
+        parser.error('3v3 has fixed roles; --mode-probs applies only to two-player arenas')
+    if teams and not args.keeper_policy:
+        parser.error('3v3 requires --keeper-policy for both defenders')
     if args.num_envs <= 0 or args.iterations <= 0 or args.opponent_update_every <= 0:
         parser.error('Environment count, iterations and opponent update interval must be positive')
     cfg,agent = load_env_cfg(args.task),load_rl_cfg(args.task)
@@ -82,6 +89,7 @@ def main():
         runner = load_runner_cls(args.task)(wrapped,asdict(agent),str(out),device='cuda:0')
         runner.load(str(args.from_policy),load_cfg={'actor':True},map_location='cuda:0')
         baseline = deepcopy(runner.alg.actor).eval().requires_grad_(False)
+        teammate = deepcopy(baseline)
         opponent = deepcopy(baseline).eval().requires_grad_(False)
         keeper_policy = baseline
         if args.keeper_policy:
@@ -112,6 +120,9 @@ def main():
                 action = torch.where(mode == mdp.KEEPER,keeper_policy(obs),action)
             return action
         env.arena_opponent_policy = opponent_policy
+        if teams:
+            env.arena_teammate_policy = teammate
+            env.arena_defender_policy = keeper_policy
         original_save = runner.save
         last_refresh = runner.current_learning_iteration
         evaluated = set()
@@ -129,6 +140,12 @@ def main():
                 command = [sys.executable,'-u','scripts/train_arena.py','--task',args.task,
                     '--from-policy',str(path),'--opponent-policy',str(args.opponent_policy or args.from_policy),
                     '--num-envs','64','--evaluate-seconds','20','--run-name',f'{args.run_name}-eval-{iteration}']
+                if args.keeper_policy:
+                    command += ['--keeper-policy',str(args.keeper_policy)]
+                if args.keeper_max_speed:
+                    command += ['--keeper-max-speed',*map(str,args.keeper_max_speed)]
+                if args.boards:
+                    command += ['--boards']
                 with (out/f'eval_{iteration}.log').open('w') as log:
                     subprocess.run(command,stdout=log,stderr=subprocess.STDOUT,check=True)
                 print(f'Fixed-opponent evaluation saved: {out / f"eval_{iteration}.log"}',flush=True)
